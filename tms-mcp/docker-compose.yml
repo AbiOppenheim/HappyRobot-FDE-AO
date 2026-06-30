@@ -1,0 +1,16 @@
+version: "3.9"
+
+services:
+  tms-mcp:
+    build: .
+    image: happyrobot-tms-mcp:latest
+    container_name: tms-mcp
+    ports:
+      - "8080:8080"
+    env_file:
+      - .env
+    environment:
+      TMS_PORT:       ${TMS_PORT:-17159}
+      SOCKET_TIMEOUT: ${SOCKET_TIMEOUT:-20}
+      MAX_RETRIES:    ${MAX_RETRIES:-3}
+    restart: unless-stopped
