@@ -70,6 +70,15 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 # Maximum frame size per the protocol spec (bytes, including \r\n terminator).
 MAX_FRAME_BYTES = 4096
 
+# Statuses that mean a load is NOT bookable and should be hidden from carriers.
+# LOAD_QUERY is documented as the "open board", so we use a denylist of clearly
+# reserved states rather than an exact == "OPEN" allowlist.  An allowlist silently
+# zeroes results whenever the wire uses any token other than the literal "OPEN"
+# (e.g. AVAILABLE / POSTED / NEW), which is the failure that produced empty
+# search results.  book_load re-checks status server-side before committing, so
+# a stray reserved load slipping through here still cannot be booked.
+RESERVED_STATUSES = frozenset({"BOOKED", "PENDING", "COVERED", "RESERVED", "CANCELLED", "EXPIRED"})
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 log = logging.getLogger("tms-mcp")
 
@@ -482,13 +491,22 @@ def search_loads(
     except TMSTransportError as e:
         return {"error": f"TMS temporarily unavailable: {e}"}
 
-    # Filter to OPEN loads only — LOAD_QUERY may return PENDING or BOOKED records
-    # that the TMS has already reserved; offering those to carriers leads to
-    # booking failures downstream.
-    open_records = [r for r in records if r.get("STATUS", "").strip().upper() == "OPEN"]
+    # Diagnostic: surface the raw STATUS tokens the board actually returns.
+    # This is what revealed the empty-result bug — the board returns valid loads
+    # whose STATUS is not the literal "OPEN", so an exact allowlist dropped them.
+    log.info("search_loads raw statuses: %r", [r.get("STATUS", "").strip() for r in records])
+
+    # Hide only loads the TMS has clearly reserved; keep everything else.
+    # LOAD_QUERY is documented as the "open board", so a denylist of reserved
+    # states is correct — an exact == "OPEN" allowlist silently zeroes results
+    # whenever the wire uses any other available-token (AVAILABLE / POSTED / NEW).
+    open_records = [
+        r for r in records
+        if r.get("STATUS", "").strip().upper() not in RESERVED_STATUSES
+    ]
     if len(open_records) < len(records):
         log.info(
-            "search_loads: dropped %d non-OPEN record(s) from results",
+            "search_loads: dropped %d reserved record(s) from results",
             len(records) - len(open_records),
         )
     return {"loads": [_load_summary(r) for r in open_records], "count": len(open_records)}
@@ -622,13 +640,14 @@ def book_load(load_id: str, mc_number: str, agreed_rate: int) -> dict:
     max_buy = detail.get("_max_buy")
 
     # Step 2 — reject loads that are not open for booking.
-    # LOAD_GET returns records regardless of STATUS (spec note), so a PENDING
-    # or BOOKED load will resolve here but fail at LOAD_BOOK with ALREADY_BOOKED.
-    # Catch it early to give the agent a clear, actionable message.
+    # LOAD_GET returns records regardless of STATUS (spec note), so a reserved
+    # load will resolve here but fail at LOAD_BOOK with ALREADY_BOOKED.
+    # Catch it early to give the agent a clear, actionable message.  Uses the
+    # same denylist as search_loads so the two stay consistent.
     load_status = detail.get("status", "").upper()
-    if load_status != "OPEN":
+    if load_status in RESERVED_STATUSES:
         log.warning(
-            "Booking rejected — load not open: load=%s status=%s",
+            "Booking rejected — load reserved: load=%s status=%s",
             load_id, load_status,
         )
         return {"error": f"Load {load_id} is not available for booking (status: {load_status}). Please find another load."}
