@@ -70,14 +70,21 @@ MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 # Maximum frame size per the protocol spec (bytes, including \r\n terminator).
 MAX_FRAME_BYTES = 4096
 
-# Statuses that mean a load is NOT bookable and should be hidden from carriers.
-# LOAD_QUERY is documented as the "open board", so we use a denylist of clearly
-# reserved states rather than an exact == "OPEN" allowlist.  An allowlist silently
-# zeroes results whenever the wire uses any token other than the literal "OPEN"
-# (e.g. AVAILABLE / POSTED / NEW), which is the failure that produced empty
-# search results.  book_load re-checks status server-side before committing, so
-# a stray reserved load slipping through here still cannot be booked.
-RESERVED_STATUSES = frozenset({"BOOKED", "PENDING", "COVERED", "RESERVED", "CANCELLED", "EXPIRED"})
+# Statuses that mean a load is genuinely dead and should never be pitched or booked.
+#
+# IMPORTANT: this list deliberately does NOT include PENDING.  The doc samples show
+# STATUS:OPEN for available loads, but the live server build returns STATUS:PENDING
+# for available loads on LOAD_QUERY — and book_load has separately observed the TMS
+# returning STATUS:PENDING on a *successful* booking.  On this wire, PENDING is a
+# live/available state, not a reservation held by someone else.  "The wire is
+# authoritative" (protocol manual).  Filtering PENDING out is what produced the
+# empty search results.
+#
+# We only drop clearly-terminal states here.  Anything not in this set (OPEN,
+# PENDING, or any other live token the wire uses) is treated as available.
+# book_load still re-checks server-side and the TMS rejects truly-taken loads
+# with ALREADY_BOOKED, so a stale record slipping through cannot be mis-booked.
+UNBOOKABLE_STATUSES = frozenset({"BOOKED", "CANCELLED", "EXPIRED"})
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(message)s")
 log = logging.getLogger("tms-mcp")
@@ -492,21 +499,20 @@ def search_loads(
         return {"error": f"TMS temporarily unavailable: {e}"}
 
     # Diagnostic: surface the raw STATUS tokens the board actually returns.
-    # This is what revealed the empty-result bug — the board returns valid loads
-    # whose STATUS is not the literal "OPEN", so an exact allowlist dropped them.
+    # This is what revealed the root cause — the board returns available loads
+    # with STATUS:PENDING (not the doc-sample "OPEN"), so treating PENDING as
+    # reserved dropped every result.
     log.info("search_loads raw statuses: %r", [r.get("STATUS", "").strip() for r in records])
 
-    # Hide only loads the TMS has clearly reserved; keep everything else.
-    # LOAD_QUERY is documented as the "open board", so a denylist of reserved
-    # states is correct — an exact == "OPEN" allowlist silently zeroes results
-    # whenever the wire uses any other available-token (AVAILABLE / POSTED / NEW).
+    # Drop only genuinely-terminal loads; keep OPEN, PENDING, and any other live
+    # token the wire uses.  book_load re-checks server-side before committing.
     open_records = [
         r for r in records
-        if r.get("STATUS", "").strip().upper() not in RESERVED_STATUSES
+        if r.get("STATUS", "").strip().upper() not in UNBOOKABLE_STATUSES
     ]
     if len(open_records) < len(records):
         log.info(
-            "search_loads: dropped %d reserved record(s) from results",
+            "search_loads: dropped %d terminal record(s) from results",
             len(records) - len(open_records),
         )
     return {"loads": [_load_summary(r) for r in open_records], "count": len(open_records)}
@@ -639,15 +645,15 @@ def book_load(load_id: str, mc_number: str, agreed_rate: int) -> dict:
     detail = _load_detail(records[0])
     max_buy = detail.get("_max_buy")
 
-    # Step 2 — reject loads that are not open for booking.
-    # LOAD_GET returns records regardless of STATUS (spec note), so a reserved
-    # load will resolve here but fail at LOAD_BOOK with ALREADY_BOOKED.
-    # Catch it early to give the agent a clear, actionable message.  Uses the
-    # same denylist as search_loads so the two stay consistent.
+    # Step 2 — reject loads that are genuinely dead (BOOKED / CANCELLED / EXPIRED).
+    # LOAD_GET returns records regardless of STATUS (spec note).  We do NOT reject
+    # PENDING here — on this wire PENDING is a live/bookable state — so a PENDING
+    # load the carrier picked from search can still be booked.  If the load is in
+    # fact taken, LOAD_BOOK below returns ALREADY_BOOKED and we surface that.
     load_status = detail.get("status", "").upper()
-    if load_status in RESERVED_STATUSES:
+    if load_status in UNBOOKABLE_STATUSES:
         log.warning(
-            "Booking rejected — load reserved: load=%s status=%s",
+            "Booking rejected — load terminal: load=%s status=%s",
             load_id, load_status,
         )
         return {"error": f"Load {load_id} is not available for booking (status: {load_status}). Please find another load."}
